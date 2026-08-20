@@ -233,14 +233,41 @@ void StdOutLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logge
 void FileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 名字
                     LogLevel::Level level , 
                     std::shared_ptr<LogEvent>event) {
-    std::lock_guard<std::mutex>lock(m_mutex);
+   
+
     if(level < m_level.load()) return; // 级别不够这个目的地的
 
-    if(!m_fileStream && !reopen() ) return; 
+    //锁保护m_fileStream
+    std::lock_guard<std::mutex>lock(m_mutex);
+    
+    // 不是真正的异步
+    const std::time_t now = event->getTime(); // 使用日志记录时间
+    if (now >= m_lastReopen + 3) {//经典工程折中
+        //即使没有轮转，也会周期 open/close
+        reopenUnlocked();
+    }
+
+    //if(!m_fileStream && !reopen() ) return; 
+    //todo  m_formatter 还有必要设置吗 
+    //仍做防御性检查。
+    // 每个Logger 有默认格式 
+    // 每个appender 在加入 logger时都会 被设置 formatter //有自己的就用自己的
+    // 如果logger 自己没有 appender 就用 root的
+    // root logger一定有 appender // 否则会报错
+    // 综上 ： ！ m_formatter 无需判断 
+    if(! m_fileStream.is_open() || !m_formatter ){  
+        std::cerr << "[tinylog] cannot write log file: " << m_fileName << '\n';
+        return;
+    }
 
     
     m_formatter->format(m_fileStream , logger , level , event);
-    m_fileStream.flush(); // 刷新缓冲区
+    // m_fileStream.flush(); // 刷新缓冲区 // 不要再每条日志都 flush
+    //打开成功：不等于 每次写入一定成功。
+    if(!m_fileStream) {
+        std::cerr << "[tinylog] write failed: " << m_fileName << '\n';
+
+    }
 }
 
 }// end of LogAppender  namespace 

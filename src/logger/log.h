@@ -85,7 +85,7 @@ namespace sylar{
 //     //              3 hash返回的是 size_t , 64位系统是64位， 与uint64对应 ，但是32位系统size_t就是32位了 
 // }
 
-/////////////////////////
+
 
 class Logger;
 
@@ -215,9 +215,6 @@ protected: // 子类需要这个成员
 };
 
 
-
-
-
 // logger 的调度中心
 // 允许 构建自己的 shared_ptr
 // root logger ： 如果自己的 logger 的appender 不存在就 使用 root logger的
@@ -227,9 +224,8 @@ public:
 public: 
     
     explicit Logger(const std::string& name = "root")
-    :m_name(std::move(name) ),                    //日志器的默认格式
-                                                 
-    m_formatter(std::make_shared<LogFormatter>( ) ){}                            
+    :m_name(std::move(name) ),                    //日志器的默认格式                     
+    m_formatter( std::make_shared<LogFormatter>( ) ){}                            
                         //%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%c]%T%f:%l%T%m%n
 
     void log(LogLevel::Level level ,LogEvent::ptr event ) ;
@@ -317,6 +313,8 @@ public:
                     LogAppender(level),
                     m_fileName(std::move(filename))
                     {
+        // 对象创建之后 就要满足可以使用
+        //对象构造完成=资源已经进入可用状态
         reopen();
     }
     /*mark : 
@@ -330,20 +328,40 @@ public:
             两个函数都应该遵守同一套锁规则
     */
     bool reopen(){
+        // 拆成一个有锁的 调用没锁的
         std::lock_guard<std::mutex> lock(m_mutex);
-        if(m_fileStream.is_open()){
-            m_fileStream.close();
-        }
-        m_fileStream.open(m_fileName , std::ios::out); // 追加的形式 std::ios::app
-        return m_fileStream.is_open(); // m_fileStream转 bool 
+        return  reopenUnlocked();
     }
-    
+    // 日志本身不能成为整个服务器吞吐量的主要瓶颈。
+    // 因为不能每一条日志都flush ，会严重降低缓冲批量写入的效果。
+    //m_fileStream 在刷新时会被读 ， 要加锁 保护一下
+    void flush() {  //没有用到 
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_fileStream.is_open()) {
+            m_fileStream.flush();
+        }
+    }
+
     virtual void log(std::shared_ptr<Logger>logger , 
                     LogLevel::Level level , 
                     std::shared_ptr<LogEvent>event) override;
+    const std::string& getfileNmae(){
+        return m_fileName; //在以后可以知道 日志写去了哪里
+    }
+private:
+    bool reopenUnlocked(){
+        if(m_fileStream.is_open()){
+            m_fileStream.close();
+        }
+        // 如果失败了 依旧更新时间 ， 如果失败不更新时间 后面每一条日志都会去尝试 open ， 系统调用风暴
+        //
+        m_fileStream.open(m_fileName , std::ios::out|std::ios::app); // 追加的形式 std::ios::app
+        return m_fileStream.is_open(); // m_fileStream转 bool 
+    }
 private:
     std::string m_fileName;
     std::ofstream m_fileStream;
+    std::time_t m_lastReopen = 0;
 };
 
 // 管理多个 logger 
@@ -389,14 +407,7 @@ private:
     Logger::ptr m_root;
 };
 
-// class LogMgr{ // 单例模式
-// public:
-//     static LogManager & GetInstance(){  //静态区单例
-//         //从 C++11 开始，函数内局部 static 的初始化由语言保证线程安全。
-//         static LogManager instance; // 局部对象
-//         return instance;
-//     }
-// };
+
 
 // 宏定义
 // (logger) -> getLevel() 日志器的 level

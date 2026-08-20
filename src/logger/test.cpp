@@ -49,9 +49,9 @@ void test3(){
     MINI_LOG_INFO(logger) 
     << "named logger has no appender, so it falls back to logger";
 
-    auto fileFormatter = std::make_shared<FileLogAppender>("system.log");
-    fileFormatter->setFormatter(std::make_shared<LogFormatter>("%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%t]%T[%c]%T%f:%l%T%m%n"));
-    logger->addAppender(fileFormatter);
+    auto fileAppender = std::make_shared<FileLogAppender>("system.log");
+    fileAppender->setFormatter(std::make_shared<LogFormatter>("%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%t]%T[%c]%T%f:%l%T%m%n"));
+    logger->addAppender(fileAppender);
 
     MINI_LOG_INFO(logger) << "now system has its own file appender";
     
@@ -70,10 +70,36 @@ void test3(){
         t.join();
     }
 }
+
+void test4(){
+    using namespace sylar;
+
+    auto logger = MINI_LOG_NAME("system");
+
+    MINI_LOG_INFO(logger) 
+    << "named logger has no appender, so it falls back to logger";
+
+    auto fileAppender = std::make_shared<FileLogAppender>("service.log");
+//     fileAppender->setFormatter(std::make_shared<LogFormatter>("%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%t]%T[%c]%T%f:%l%T%m%n"));
+    logger->addAppender(fileAppender);
+
+    MINI_LOG_INFO(logger) << "now system has its own file appender";
+    
+    for(int i = 0; i < 20; ++i) {
+      MINI_LOG_INFO(logger)<< "tick = "<< i;
+
+      fileAppender->flush();
+
+      std::this_thread::sleep_for(
+            std::chrono::seconds(1)
+      );   
+    }
+    
+}
 int main(){
     
     // ? dsds
-    test3();
+    test4();
 
 }
 /*mark 完整流程
