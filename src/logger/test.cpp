@@ -96,10 +96,46 @@ void test4(){
     }
     
 }
+void test5(){ //V 15
+      using namespace sylar;
+
+      LoggerConfig system;
+      system.name = "system";
+      system.level = LogLevel::INFO;
+      system.formatter = "%d{%H:%M:%S}"
+                        "%T[%p]"
+                        "%T[%c]"
+                        "%T%m%n";
+
+      //这是用户想要的 appender ,只包含数据
+      //叫做： configuration description
+      //又叫：  DTO ，  Data Transfer Object
+      AppenderConfig file_appender;
+      file_appender.type = AppenderConfig::Type::File;
+      file_appender.file = "system.log";
+      file_appender.level = LogLevel::ERROR;
+      file_appender.formatter = "[FILE][%p] %m%n";
+      AppenderConfig console_appender;
+      console_appender.type = AppenderConfig::Type::Stdout;
+      console_appender.level = LogLevel::DEBUG;
+      // console_appender.formatter = "[FILE][%p] %m%n";
+
+      system.appenders= {file_appender ,console_appender };
+
+      LogManager::GetInstance().applyConfig( {system} );
+
+      auto logger = MINI_LOG_NAME("system");
+      MINI_LOG_DEBUG(logger)<< "filtered by logger level";
+      MINI_LOG_INFO(logger)<<  "console only";
+      MINI_LOG_ERROR(logger)<< "console + system.log";
+
+}
+
+
 int main(){
     
     // ? dsds
-    test4();
+    test5();
 
 }
 /*mark 完整流程

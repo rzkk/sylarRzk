@@ -13,7 +13,7 @@
 #include<map>
 #include<thread>
 #include<mutex>
-#include <atomic>
+#include <atomic> // 对Level 的原子操作
 
 //  mark  : 设计原则 ， 锁属于对象 
 /*  mark: 线程安全判断法:  T m_xxx; 要不要加锁
@@ -94,7 +94,8 @@ class Logger;
 //mark ： 天然是一次日志调用的局部数据 ， 只归单个线程 所有
 class LogLevel{
 public: 
-    enum Level{
+    // 已经是在 局部作用域中定义 enum 了 
+    enum Level{ 
         DEBUG = 1,
         INFO = 2,
         WARN = 3,
@@ -102,7 +103,8 @@ public:
         FATAL = 5
     };
 
-    static const std::string ToString(Level level);
+    static const std::string LevelToString(Level level);
+    static Level StringToLevel(const std::string & text);//依旧是教学简化
 };
 
 // 一条日志携带的原始数据 //原始数据中是不应该有 level 的
@@ -225,7 +227,7 @@ public:
     
     explicit Logger(const std::string& name = "root")
     :m_name(std::move(name) ),                    //日志器的默认格式                     
-    m_formatter( std::make_shared<LogFormatter>( ) ){}                            
+    m_formatter( std::make_shared<LogFormatter>() ){}                            
                         //%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%c]%T%f:%l%T%m%n
 
     void log(LogLevel::Level level ,LogEvent::ptr event ) ;
@@ -260,6 +262,7 @@ public:
         m_appenders.clear(); 
     } // 目的地清空
    void setFormatter(LogFormatter::ptr formatter);
+   void setFormatter(const std::string& pattern );
    LogFormatter::ptr getFormatter() {
         return m_formatter;
    }
@@ -364,6 +367,26 @@ private:
     std::time_t m_lastReopen = 0;
 };
 
+//描述： 我希望创建一个什么样的 Appender。
+struct AppenderConfig{
+    enum class Type{
+        Stdout , File
+    };
+    Type type = Type::Stdout;
+    LogLevel::Level level = LogLevel::DEBUG; // Appender 就有过滤的能力 ， 也有级别
+    std::string formatter;                  // 保存的是 formatter的描述
+    std::string file;
+};
+
+struct LoggerConfig {
+    std::string name;
+    LogLevel::Level level = LogLevel::DEBUG;
+    std::string formatter;
+    std::vector<AppenderConfig> appenders;
+};
+
+
+
 // 管理多个 logger 
 // 会建立 root 
 class LogManager{
@@ -373,7 +396,9 @@ public:
         return instance;
     }
    
-    Logger::ptr getRoot(){ return m_root;}
+    Logger::ptr getRoot(){ 
+        return m_root;
+    }
     // 这里两个线程同时访问 ， 会同时创建两个 同名的logger
     // 需要对 map做互斥访问
     Logger::ptr getLogger(const std::string & name){ 
@@ -390,6 +415,68 @@ public:
         m_loggers[name] = logger;
         return logger;
     }
+    //读完配置之后 开始构造Logger
+    void applyConfig(const std::vector<LoggerConfig>& configs){
+        for(auto&  config : configs ){
+            if(config.name.empty()){ // 名字是空的跳过
+                continue;//todo : 报错 抛异常
+            }
+            // 从名字创建 logger  
+            // 还能判断是否已经存在了
+            // 如果已经存在时 重新创建一个新的，那么旧的要销毁，但是使用的是shared_ptr ， 无法立刻真正销毁
+            // 别的地方拿到的还有可能是旧的logger ,所以不如 直接在旧的基础上改
+            auto logger = getLogger(config.name); 
+            logger->setLevel(config.level);
+            //logger 在创建时就会配置默认的 logformatter 
+            // 默认的logformatter 有默认的格式
+            if(!config.formatter.empty()){
+                //如果是空的 ， logger 
+                //LogFormatter
+                logger->setFormatter(config.formatter); // 
+            }
+
+            //对logger的appender: clear + rebuild
+            // 选择清空appender 而不是在原来基础上改： 旧的无法去除， 
+            //  stale runtime state : 旧运行状态残留
+            // 但是在配置文件迭代中 即使只改一个level 也会引发清空重建 
+            logger->clearAppender(); //不管logger是不是已经存在，都要从新刷新配置
+            // note : 简单性 优先于 增量更新性能
+            
+
+            /*mark appender 的formatter : 
+            *   1  如果appender 在初始化时 没有设置 formatter ,
+            *       在加入logger是时，使用Logger的formatter
+            *   2 如果初始化时有自己的formatter ,那就用自己的
+            *   3 如果logger中 没有加入 appender , 那就使用 root的appender 
+            *   4 所以 root 一定要给  appender  ， 强制性的 // 给的时候就会设置 formatter
+            */  
+            // 如果appender没有
+            for(const auto & appender_config : config.appenders){
+                //工厂式创建 
+                LogAppender::ptr appender;
+                if(appender_config.type == AppenderConfig::Type::Stdout){
+                    appender = std::make_shared<StdOutLogAppender>();
+                }else{
+                    if(appender_config.file.empty()){ //文件目的地空
+                        continue;  // todo: config error
+
+
+                    }
+                    appender = std::make_shared<FileLogAppender>(appender_config.file);
+                }
+                appender->setlevel(appender_config.level);
+                if(!appender_config.formatter.empty()){
+                    auto formatter = std::make_shared<LogFormatter>(appender_config.formatter);
+            
+                    if(!formatter->isError())           // todo : 后续记录错误 并反馈 ，要让用户知道           
+                        appender->setFormatter(std::move(formatter) );
+                }
+                logger->addAppender(appender);
+            }
+
+        }
+    }
+
 private:
     //LogManager();
     explicit LogManager(){
@@ -406,6 +493,9 @@ private:
     std::map<std::string ,Logger::ptr>m_loggers ; // 通过名字找 logger 
     Logger::ptr m_root;
 };
+
+
+
 
 
 

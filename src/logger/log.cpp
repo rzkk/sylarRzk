@@ -20,7 +20,7 @@ namespace { // 匿名
 
 // class LogLevel 
 namespace sylar{ 
-const std::string LogLevel::ToString(Level level){
+const std::string LogLevel::LevelToString(Level level){
     switch (level)
     {
     case DEBUG: return "DEBUG";
@@ -31,6 +31,17 @@ const std::string LogLevel::ToString(Level level){
     default: return "UNKNOW";
     }
 }
+
+LogLevel::Level LogLevel::StringToLevel(const std::string & text){
+    if (text == "debug" || text == "DEBUG") return DEBUG;
+    if (text == "info"  || text == "INFO")  return INFO;
+    if (text == "warn"  || text == "WARN")  return WARN;
+    if (text == "error" || text == "ERROR") return ERROR;
+    if (text == "fatal" || text == "FATAL") return FATAL;
+    return DEBUG; // 作为未知字符串的兜底，
+    //若原来是error 拼错 ， 会导致输出大量的 DEBUG  // logger 或者 LogAppender的级别设置错误 
+}
+
 }// end of LogLevel  namespace 
 
 // class LogEvent
@@ -158,9 +169,13 @@ void Logger::setFormatter(LogFormatter::ptr formatter){
             */
         }
     }
-    
 }
-
+void Logger::setFormatter(const std::string& pattern ){
+    auto formatter = std::make_shared<LogFormatter>(pattern);
+    if(!formatter->isError()){
+        setFormatter(formatter);
+    }
+}
 // addAppender 需要加两层锁
 // 
 void Logger::addAppender(std::shared_ptr<LogAppender>appender){
@@ -181,7 +196,7 @@ void Logger::addAppender(std::shared_ptr<LogAppender>appender){
         *        2 用户专门设置了专属 formatter 
         */
         if(!appender->m_hasFormatter)  // 如果目的地没有 formatter ， 就是用Logger的
-             appender->m_formatter = m_formatter;
+            appender->m_formatter = m_formatter;
     }
     
 
@@ -249,14 +264,14 @@ void FileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 
 
     //if(!m_fileStream && !reopen() ) return; 
     //todo  m_formatter 还有必要设置吗 
-    //仍做防御性检查。
+    //答 ： 仍做防御性检查。
     // 每个Logger 有默认格式 
     // 每个appender 在加入 logger时都会 被设置 formatter //有自己的就用自己的
     // 如果logger 自己没有 appender 就用 root的
     // root logger一定有 appender // 否则会报错
     // 综上 ： ！ m_formatter 无需判断 
     if(! m_fileStream.is_open() || !m_formatter ){  
-        std::cerr << "[tinylog] cannot write log file: " << m_fileName << '\n';
+        std::cerr << "[sylarlog] cannot write log file: " << m_fileName << '\n';
         return;
     }
 
@@ -265,7 +280,7 @@ void FileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 
     // m_fileStream.flush(); // 刷新缓冲区 // 不要再每条日志都 flush
     //打开成功：不等于 每次写入一定成功。
     if(!m_fileStream) {
-        std::cerr << "[tinylog] write failed: " << m_fileName << '\n';
+        std::cerr << "[sylarlog] write failed: " << m_fileName << '\n';
 
     }
 }
@@ -295,7 +310,7 @@ public:
                         Logger::ptr  /*logger*/,  // 这种写法代表接口需要这个参数，但是实际上没有用到
                         LogLevel::Level level, 
                         LogEvent::ptr /*event*/ )override {
-        os << LogLevel::ToString(level);
+        os << LogLevel::LevelToString(level);
     }
 };
 // logger的 name 
