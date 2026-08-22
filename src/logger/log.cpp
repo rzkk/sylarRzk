@@ -10,13 +10,53 @@
 #include<functional>
 #include<map>
 
+// 日志绝对时间 ： 使用 std::time_t 
+// 日志累计运行时间 ： 是使用 steady_clock
+
 namespace sylar{
-namespace { // 匿名
+namespace { // 匿名 :这些变量只属于当前 log.cpp 翻译单元，不暴露为整个工程可直接访问的全局符号
+// 记录：  log.cpp 这组静态对象初始化时的 steady_clock 时间点
+// g_process_start 在main 之前初始化  ， 非常接近系统启动时间，但还是有差别的
+const auto g_process_start = std::chrono::steady_clock::now(); 
+thread_local std::string t_thread_name = "unnamed";//线程存在但是还没有被命名
+thread_local std::uint64_t t_fiber_id = 0;  //todo: 尚未接入 Fiber 
+/*mark : thread_local
+*  g_process_start : 所有线程共享一个变量
+*  t_thread_name ：  每个 OS 线程各自拥有一份独立实例
+*   t_thread_name ： 是属于线程的独自私有的 ， 所以必须独占
+*/
+}
+}
+
+//class LogContext
+namespace sylar{
+// 不使用 std::time(nullptr) ： 其 wall clock / 日历时间 ， 受系统时间调整影响
+std::uint64_t LogContext::ElapsedMs(){
+    const auto now = std::chrono::steady_clock::now();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_process_start).count() );
+}
+
+//mark pass-by-value + move 的意义：
+//
+void LogContext::setThreadName(std::string name){ 
+    t_thread_name = std::move(name);
+}
+
+const std::string& LogContext::getThreadName(){ // 调用者 不能通过返回值修改 加const 
+    return t_thread_name;
+}
+
+void LogContext::setFiberId(std::uint64_t id) {  // 每次Fiber切换时，要切换
+    t_fiber_id = id;
+}
+
+std::uint64_t LogContext::getFiberId() {
+    return t_fiber_id;
+}
 
 }
 
-
-}
 
 // class LogLevel 
 namespace sylar{ 
@@ -31,7 +71,6 @@ const std::string LogLevel::LevelToString(Level level){
     default: return "UNKNOW";
     }
 }
-
 LogLevel::Level LogLevel::StringToLevel(const std::string & text){
     if (text == "debug" || text == "DEBUG") return DEBUG;
     if (text == "info"  || text == "INFO")  return INFO;
@@ -93,6 +132,7 @@ void Logger::log( LogLevel::Level level ,LogEvent::ptr event  ){
             return ;
     }
 
+    
     /* mark 如果全都加锁的话 ， 整个IO时间太长 如写文件时间很慢
     *  所以 复制一份之后， 使用复制的新的局部变量去IO ， 
     * 不用去加锁 ， 不会影响
@@ -223,6 +263,7 @@ namespace sylar{
         std::lock_guard<std::mutex>lock(m_mutex);
         m_formatter = std::move(formatter);
         m_hasFormatter = static_cast<bool>(m_formatter);
+       // std::cout<<__LINE__<<"  "<<m_hasFormatter<<std::endl;
         //mark 专门给用户用的 ，设置此appender 专属 formatter
     }
     LogFormatter::ptr LogAppender::getFormatter(){
@@ -234,13 +275,15 @@ namespace sylar{
 void StdOutLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 名字
                     LogLevel::Level level , 
                     std::shared_ptr<LogEvent>event) {
-     std::lock_guard<std::mutex>lock(m_mutex);
+    
     //多个线程很可能同时执行 StdOutLogAppender::log()。
     // 都需要 使用 std::cout 
     // 再往下 每个 FormatItem 中的format  都没有加锁了
     // 同时 还保护 m_formatter ，  防止别人 setFormatter 
     if(level < m_level.load()) return; // 级别不够这个目的地的
-    m_formatter->format(std::cout , logger , level , event);
+    std::lock_guard<std::mutex>lock(m_mutex);  // 这是加给 cout 
+    if(m_formatter)
+        std::cout<<m_formatter->format(logger , level , event);
 
   
 }
@@ -252,8 +295,8 @@ void FileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 
 
     if(level < m_level.load()) return; // 级别不够这个目的地的
 
-    //锁保护m_fileStream
-    std::lock_guard<std::mutex>lock(m_mutex);
+    //锁保护m_fileStream  // 这是加给 m_fileStream  ， 防止输出紊乱的
+    std::lock_guard<std::mutex>lock(m_mutex); 
     
     // 不是真正的异步
     const std::time_t now = event->getTime(); // 使用日志记录时间
@@ -276,13 +319,200 @@ void FileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 
     }
 
     
-    m_formatter->format(m_fileStream , logger , level , event);
+    m_fileStream << m_formatter->format( logger , level , event);
     // m_fileStream.flush(); // 刷新缓冲区 // 不要再每条日志都 flush
     //打开成功：不等于 每次写入一定成功。
     if(!m_fileStream) {
         std::cerr << "[sylarlog] write failed: " << m_fileName << '\n';
 
     }
+}
+
+// 这是生产者调用的
+// 新日志入队
+void AsyncFileLogAppender::log(std::shared_ptr<Logger>logger ,  //为了输出logger 名字
+                    LogLevel::Level level , 
+                    std::shared_ptr<LogEvent>event) {
+   
+
+    if(level < m_level.load()) return; // 级别不够这个目的地的
+    //std::lock_guard<std::mutex>lock(m_mutex); // 异步这里根本不需要，因为没有真正的写缓冲区
+
+    if(!m_accepting.load()){
+        ++m_rejectAfterStop;
+        return ;
+    }
+
+    // 这里面加了锁 
+    //因为整个log 没有加m_mutex ， 所以外部有可能set m_formater ,因此使用getFormatter得到一个副本 
+    // shared_ptr snapshot
+        /*业务线程取到旧 shared_ptr
+        ↓
+        配置线程替换 formatter_
+        ↓
+        旧 Formatter 只要业务线程还持有
+        就不会析构
+        ↓
+        本次日志安全完成格式化*/
+    auto fmt = getFormatter(); 
+    if(!fmt){
+        return ;
+    }
+
+    // 这里不需要加锁，都是局部变量
+    std::string line = fmt->format(logger , level , event);
+    std::size_t bytes = line.size();
+
+    // 单个的日志直接冲破了限制 ，
+    // 后面的wait( fitsUnlocked(bytes) )  //如果不处理， 死锁
+    // 在进入阻塞等待之前，先排除永远不可能满足的条件。
+    if(bytes > m_options.max_queue_bytes){
+        ++m_oversized;
+        ++m_dropped;
+        return;
+    }
+
+    std::unique_lock<std::mutex>lock(m_queuemutex);
+
+    if(!m_accepting.load() || m_stop){
+        ++m_rejectAfterStop;
+        return;
+    }
+
+    // FATAL 默认不走 drop-new：即使普通日志采用丢弃策略，也等待一个队列槽位。
+    const bool preserve_record = level >= LogLevel::FATAL;
+    if(m_options.overflow_policy == OverflowPolicy::BlockProducer || preserve_record){
+        m_notFullcv.wait(lock , [&]{
+            return m_stop || m_accepting.load() || fitsUnlocked(bytes);  // 有槽位时唤醒
+        }  );
+        if(m_stop || !m_accepting.load()){ // 是因为 异步appender 关闭而唤醒
+            ++m_rejectAfterStop;
+            return ;
+        }
+    }else if(!fitsUnlocked(bytes)){ // DropNewest 是因为
+        ++m_dropped;
+        return;
+    }
+    
+    // 你的下面就是入队 : 如果为空 ，说明worker 很可能在wait 
+    // 新日志入队之后, 这时候应该唤醒
+    const bool need_wakeup = m_queue.empty(); 
+
+    std::uint64_t seq = ++m_nextSequence;
+    m_queue.push_back({seq, std::move(line)});
+    m_queue_bytes += bytes;
+    // 成功进入共享队列的总记录数；当前实现中与最后已分配 sequence 数值同步增长。
+    ++m_enqueued; //todo  入队条数++ ?
+    
+    // 已经达到批量阈值唤醒门槛
+    //todo worker 有可能在等待特定时间刷新 
+    bool reached_batch = m_queue.size() >= m_options.batch_items;
+    bool high_priority = level >= m_options.flush_on_level; //有大于这个level的日志出现立刻唤醒worker
+
+    if(high_priority || reached_batch){
+        m_forceFlush = true;
+    }
+    lock.unlock();
+
+
+    if(need_wakeup || reached_batch ||high_priority){
+        m_cv.notify_one();
+    }
+
+    if(m_options.sync_flush_fatal && level >= LogLevel::FATAL){
+        flush();
+    }
+
+    // 唤醒 worker ,在生产者释放m_queuemutex，之后再唤醒worker 
+    // 并且只有一个 worker
+    //每一都会写： 不好 
+    // 避免频繁唤醒 worker 
+    // if(logCnt >= m_capacity * 0.5)
+    //     m_cv.notify_one(); 
+}
+
+// 等待调用这一刻之前“已经成功入队”的日志被 worker 处理到目标 sequence。
+// queue.empty() 不能作为完成条件：worker 可能已经 swap 到本地 batch，但尚未写文件。
+// 因此先取 target=enqueued_，强制唤醒 worker，再等 flushed_sequence_ >= target。
+//
+// 注意：这里的 flush 仍是 ostream flush 级语义，不是 fsync 断电持久化保证。
+void AsyncFileLogAppender::flush(){
+    // todo 
+    std::uint64_t target = m_enqueued.load(); // 当前的入队数
+    {
+        std::lock_guard<std::mutex>lock(m_queuemutex);
+        m_forceFlush = true;
+    }
+
+    m_cv.notify_one(); // 唤醒worker
+
+    std::unique_lock<std::mutex>lock(m_queuemutex);
+    m_drainedCv.wait(lock , [&]{
+        return m_flushedSequence.load() >= target || ( m_stop && m_queue.empty() ) ;
+    });
+    
+
+}
+bool AsyncFileLogAppender::fitsUnlocked(std::size_t bytes) const {  //先过滤
+    return  m_queue.size() < m_options.max_queue_items 
+            && m_queue_bytes + bytes < m_options.max_queue_bytes;     
+    // /条数没超过并且当前字节数 + 新日志字节数没超过 才能真的入队
+}
+// -----------------------------
+// 单消费者后台线程主循环
+// -----------------------------
+// 核心思想：共享队列只在很短临界区访问；真正文件 I/O 在锁外。
+// wait -> 可选短聚合 -> 判断停止 -> swap 到本地 batch -> 释放 queue lock
+// -> writeBatch -> clear -> 下一轮。
+void AsyncFileLogAppender::workerLoop(){
+    // 共享数据快速搬到线程本地，然后锁外做慢工作。
+
+    LogContext::setThreadName("Loger_worker");
+    std::deque<std::string> batch;
+    while(true){
+        bool force_flush = false;
+
+        {        // 对队列的操作
+            std::unique_lock<std::mutex> lock(m_queuemutex);
+            // predicate 版本会检查：
+                //真有日志吗？
+                //正在停止吗？
+            // m_stop放入 predicate中检查： 避免了系统停止， 但是没人告诉woker 
+            // m_stop 告诉worker , 系统有没有停
+            m_cv.wait(lock , [this](){
+                // queue empty且not stopping ,阻塞: 
+                // 
+                return m_stop || m_forceFlush ||  !m_queue.empty();  // 返回true 则不阻塞 
+                //m_forceFlush : 需要强制刷新了 ， 唤醒
+            });
+
+            //第一条日志来了之后 ，给生产者一个短暂聚合窗口， 减少“一条日志一次 flush”。
+            // 系统没停止 && 没有强制flush && 队列非空 && 队列没有达到 batch_items
+            // 没有达到最大聚合窗口时间
+            if(!m_stop &&!m_forceFlush &&
+               !m_queue.empty() &&  m_queue.size() < m_options.batch_items  &&
+                m_options.flush_interval.count() > 0){ // todo 如何实现的 
+
+                m_cv.wait_for(lock ,m_options.flush_interval , [&](){
+                    return m_stop || m_forceFlush || m_queue.size() >= m_options.batch_items;
+                }  );
+            } 
+            
+            
+            batch.swap(m_queue); // m_queue 变空了 // 交换队列 
+            m_queue_bytes = 0;
+        }
+        // 写磁盘很慢， 将共享的资源 m_queue 的副本去写
+        //避免生产者长时间 不能enqueue
+        for(const auto & line:batch){ // 只有这一个线程在往文件里面写
+            m_fileStream <<line;
+        }
+        m_fileStream.flush();
+        batch.clear();
+
+    }
+    m_fileStream.flush();
+
 }
 
 }// end of LogAppender  namespace 
@@ -416,6 +646,36 @@ public:
     }
 };
 
+class ElapsedItem:public LogFormatter::FormatItem {  
+public:
+    explicit ElapsedItem(const std::string = "" /*unused */ ){} 
+    void virtual format( std::ostream & os ,
+                        Logger::ptr  /*logger*/,  // 这种写法代表接口需要这个参数，但是实际上没有用到
+                        LogLevel::Level /*level*/, 
+                        LogEvent::ptr event )override{
+        os << event->getElapsedms();
+    }
+};
+class FiberItem:public LogFormatter::FormatItem {  
+public:
+    explicit FiberItem(const std::string = "" /*unused */ ){} 
+    void virtual format( std::ostream & os ,
+                        Logger::ptr  /*logger*/,  // 这种写法代表接口需要这个参数，但是实际上没有用到
+                        LogLevel::Level /*level*/, 
+                        LogEvent::ptr event )override{
+        os << event->getFiberId();
+    }
+};
+class ThreadNameItem :public LogFormatter::FormatItem {  
+public:
+    explicit ThreadNameItem(const std::string = "" /*unused */ ){} 
+    void virtual format( std::ostream & os ,
+                        Logger::ptr  /*logger*/,  // 这种写法代表接口需要这个参数，但是实际上没有用到
+                        LogLevel::Level /*level*/, 
+                        LogEvent::ptr event )override{
+        os << event->getThreadName();
+    }
+};
 void LogFormatter::init(){
 
 
@@ -541,8 +801,19 @@ void LogFormatter::init(){
             "t" , [](const std::string & f){ 
                 return std::make_shared<ThreadIdItem>(f); 
             }  
-         },
-
+         },{
+            "r" , [](const std::string & f){ 
+                return std::make_shared<ElapsedItem>(f); 
+            }  
+         },{
+            "F" , [](const std::string & f){ 
+                return std::make_shared<FiberItem>(f); 
+            }  
+         },{
+            "N" , [](const std::string & f){ 
+                return std::make_shared<ThreadNameItem >(f); 
+            }  
+         }
     };
 
     for(auto & item : parsed){
@@ -568,13 +839,23 @@ void LogFormatter::init(){
 
 
 
-void LogFormatter::format(std::ostream & os,const std::shared_ptr<Logger>&logger , 
+std::string LogFormatter::format(const std::shared_ptr<Logger>&logger , 
                                     LogLevel::Level level,   // 这是要输出的 level
-                                    const LogEvent::ptr& event){  // event 中不包含 level 
+                                    const LogEvent::ptr& event){  // event 中不包含 level
+    std::ostringstream out;
     for(auto& item : m_items)   {
-        item->format(os , logger , level , event);
+        item->format(out , logger , level , event);
     }                                 
+    return out.str();
 }
+
+// void LogFormatter::format(const std::shared_ptr<Logger>&logger , 
+//                                     LogLevel::Level level,   // 这是要输出的 level
+//                                     const LogEvent::ptr& event){  // event 中不包含 level 
+//     for(auto& item : m_items)   {
+//         item->format(os , logger , level , event);
+//     }                                 
+// }
 
 
 

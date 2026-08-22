@@ -101,12 +101,9 @@ void test5(){ //V 15
 
       LoggerConfig system;
       system.name = "system";
-      system.level = LogLevel::INFO;
-      system.formatter = "%d{%H:%M:%S}"
-                        "%T[%p]"
-                        "%T[%c]"
-                        "%T%m%n";
-
+      system.level = LogLevel::INFO;  // 直接过滤掉了 DEBUG 
+     // system.formatter = "%d{%H:%M:%S}%T[%p]%T[%c]%T%m%n";
+//
       //这是用户想要的 appender ,只包含数据
       //叫做： configuration description
       //又叫：  DTO ，  Data Transfer Object
@@ -114,11 +111,12 @@ void test5(){ //V 15
       file_appender.type = AppenderConfig::Type::File;
       file_appender.file = "system.log";
       file_appender.level = LogLevel::ERROR;
-      file_appender.formatter = "[FILE][%p] %m%n";
+      file_appender.formatter = "%d{%H:%M:%S}[FILE][%p] %m%n";
       AppenderConfig console_appender;
       console_appender.type = AppenderConfig::Type::Stdout;
       console_appender.level = LogLevel::DEBUG;
-      // console_appender.formatter = "[FILE][%p] %m%n";
+      // console_appender.formatter = "%d{%H:%M:%S}%T[%p]%T[%c]%Ttid=%t%Tthread=%N%Tfiber=%F"
+                                          // "%Telapse=%rms%T%m%n";
 
       system.appenders= {file_appender ,console_appender };
 
@@ -126,8 +124,53 @@ void test5(){ //V 15
 
       auto logger = MINI_LOG_NAME("system");
       MINI_LOG_DEBUG(logger)<< "filtered by logger level";
+      MINI_LOG_INFO(logger)<< "Debbuf";
       MINI_LOG_INFO(logger)<<  "console only";
       MINI_LOG_ERROR(logger)<< "console + system.log";
+}
+void test6(){ //V 16 // 手动模拟上下文
+      using namespace sylar;
+
+      LogContext::setThreadName("main");
+      LogContext::setFiberId(7); 
+
+      auto logger = MINI_LOG_NAME("context"); // logger 名字
+      // auto a =  std::make_shared<StdOutLogAppender>();
+      logger->addAppender( std::make_shared<StdOutLogAppender>());
+      logger->setFormatter(
+        "%d{%H:%M:%S}%T[%p]%T[%c]%T"
+        "tid=%t%Tthread=%N%Tfiber=%F%Telapse=%rms%T%m%n");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      MINI_LOG_INFO(logger) << "metadata now matches Sylar's logging context shape";
+}
+void test7(){ //V 16 // 手动模拟上下文
+      using namespace sylar;
+
+      auto logger = MINI_LOG_NAME("context"); // logger 名字
+      // auto a =  std::make_shared<StdOutLogAppender>();
+      logger->addAppender( std::make_shared<StdOutLogAppender>());
+      logger->setFormatter(
+        "%d{%H:%M:%S}%T[%p]%T[%c]%T"
+        "tid=%t%Tthread=%N%Tfiber=%F%Telapse=%rms%T%m%n");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      std::thread a([&] {
+            LogContext::setThreadName("worker_a");
+            LogContext::setFiberId(7); 
+            MINI_LOG_INFO(logger)<< "from A";
+      });
+
+      std::thread b([&] {
+            LogContext::setThreadName("worker_b");
+            LogContext::setFiberId(8); 
+            MINI_LOG_INFO(logger)<< "from B";
+      });
+
+
+      
+      MINI_LOG_INFO(logger) << "metadata now matches Sylar's logging context shape";
+      a.join();
+      b.join();
 
 }
 
@@ -135,7 +178,7 @@ void test5(){ //V 15
 int main(){
     
     // ? dsds
-    test5();
+    test7();
 
 }
 /*mark 完整流程

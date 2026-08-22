@@ -1,8 +1,9 @@
 #pragma once 
 // #include"logger.h"
 
-#include <cstdarg> // 这是va_start 
-
+#include <cstdarg>  // 这是va_start 
+#include <atomic> // 对Level 的原子操作
+#include<chrono>
 #include<string>
 #include<sstream>
 #include<memory>
@@ -13,7 +14,16 @@
 #include<map>
 #include<thread>
 #include<mutex>
-#include <atomic> // 对Level 的原子操作
+
+//不同机器unsigned long 尺寸可能不同
+// 表明 我至少需要一个 稳定的64位无符号数 
+#include<cstdint> // std::uint64_t
+
+#include<iostream>
+
+#include<condition_variable> // 异步IO
+
+#include<deque> // 日志队列
 
 //  mark  : 设计原则 ， 锁属于对象 
 /*  mark: 线程安全判断法:  T m_xxx; 要不要加锁
@@ -89,6 +99,23 @@ namespace sylar{
 
 class Logger;
 
+// 记录当前执行上下文是什么？
+// 包含 程序运行多久 ， 当前线程叫什么 
+//当前的Fiber是谁
+// /当前线程名 , 当前 Fiber 与哪个logger无关，这些东西要加到event中 
+// 提供  Thread/Fiber的 api , 后面接入真实的thread Fiber的时候保持接口不变
+//角色 ： context provider
+// 
+class LogContext{ // 为了后面加入 thread 做铺垫 // 其实 后面 sylar 并没有这个
+public:
+    static std::uint64_t ElapsedMs();
+    static void setThreadName(std::string name);
+    static const std::string& getThreadName() ;
+
+    // 目前默认 0；以后 Fiber 模块在切换协程时更新它。
+    static void setFiberId(std::uint64_t id);
+    static std::uint64_t getFiberId();
+};
 
 //日志的重要程度
 //mark ： 天然是一次日志调用的局部数据 ， 只归单个线程 所有
@@ -107,26 +134,48 @@ public:
     static Level StringToLevel(const std::string & text);//依旧是教学简化
 };
 
-// 一条日志携带的原始数据 //原始数据中是不应该有 level 的
+// 一条日志携带的原始数据 
+// 对于协程来说 ，切换很频繁
+// 一条event 产生后进入异步队列中， 还没执行就切换Fiber 
+// 如果不把上下文保存到event中， 那么这条日志就失真了
+// mark : event是日志发生的那一时刻的 现场快照
+// event : immutable-like context snapshot   // snapshot ： 快照
+// 类似于不可变的上下文快照
+//在你触发动作的那一瞬间，把所有需要的数据全部按值拷贝（或移动）到一个独立的、隔离的对象中。
+//这个对象就像一个时间胶囊，无论什么时候被谁打开，里面的内容都完全定格在了它被创建的那一毫秒，安全且可靠。
 class LogEvent{
 public:
     using ptr = std::shared_ptr<LogEvent>;
 public:
     LogEvent( std::shared_ptr<Logger> logger, LogLevel::Level level , 
-        const char * filename ,int line , 
-        std::time_t time ,std::thread::id threadId = std::this_thread::get_id()):
+        const char * filename ,uint32_t line , 
+        std::time_t time = std::time(nullptr)  ,
+        std::uint64_t elapsedms =LogContext::ElapsedMs(),
+        std::thread::id threadId = std::this_thread::get_id(),
+        std::uint64_t fiberId = LogContext::getFiberId(),
+        std::string   threadName = LogContext::getThreadName() // event 要保存一份完整的副本
+        ):
     m_logger(logger),m_level(level),
     m_fileName(filename),m_line(line),
-    m_time(time),m_threadId(threadId){}
+    m_time(time),m_elapsedMs(elapsedms),
+    m_threadId(threadId),m_fiberId(fiberId),
+    m_threadName(threadName){}
+    //默认参数自动采集上下文: 原来的日志宏不用修改。
 
-    std::stringstream & getSS() {return m_ss;} // 会对SS做修改 
+   
     LogLevel::Level getLevel() const { return m_level ;}
     const std::string  getFile()  const{ return m_fileName ;}
-    int getLine() const { return m_line ;}
+    uint32_t getLine() const { return m_line ;}
     std::string getContent() const { return m_ss.str(); }
+    std::stringstream & getSS() {return m_ss;} // 会对SS做修改 
     std::shared_ptr<Logger>  getLogger()const{ return m_logger; }
-    std::thread::id getThreadId()const{ return m_threadId; }
+    
     std::time_t getTime()  const{ return m_time ;}
+    std::uint64_t getElapsedms()const { return m_elapsedMs; }
+    std::thread::id getThreadId()const{ return m_threadId; }
+    std::uint64_t getFiberId()const { return m_fiberId;}
+    const std::string &getThreadName(){ return m_threadName;}
+
 
     // 实现printf风格
     void format(const char * fmt , ...);
@@ -135,13 +184,16 @@ public:
 private:
     std::shared_ptr<Logger> m_logger;   // Logger 可以被多个线程使用
     LogLevel::Level m_level;
-    
+   
     std::string m_fileName;
-    int32_t m_line;  // signed int ->  int
+    uint32_t m_line;  // signed int ->  int
 
     //uint64_t  m_threadId; // unsigned long int // 描述的是 哪条线程产生了 这条日志， 所以 threadId 属于 event , 不属于 Logger 
-    std::time_t m_time;
+    std::time_t m_time;       //日志的发生在几点几分几秒
+    std::uint64_t m_elapsedMs; // 回答 日志发生在系统启动后大约多久发生
     std::thread::id   m_threadId; 
+    std::uint64_t m_fiberId;
+    std::string m_threadName;
     std::stringstream m_ss; // 可以用来实现 流式 日志
 }; // end of LogEvent
 
@@ -174,11 +226,22 @@ public:
                              LogLevel::Level level ,  LogEvent::ptr event) = 0;
     };
 public:
-    explicit LogFormatter(const std::string  pattern = "%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%c]%T%f:%l%T%t%T%m%n")
+    explicit LogFormatter(const std::string pattern = 
+        // "%d{%Y-%m-%d %H:%M:%S}%T[%p]%T[%c]%T%f:%l%T%t%T%m%n"
+        "%d{%Y-%m-%d %H:%M:%S}"
+        "%T[%p]"
+        "%T[%c]"
+        "%T%t"
+        "%T%N"
+        "%T%F"
+        "%T%f:%l"
+        "%Telapse=%rms"
+        "%T%m%n"
+    )
     :m_pattern( std::move(pattern) ){
         init(); // 在这个class formatter 创建时执行 
     }
-    void format(std::ostream & os,const std::shared_ptr<Logger>&logger , 
+    std::string format(const std::shared_ptr<Logger>&logger , 
                         LogLevel::Level level, const LogEvent::ptr& event ) ;
     bool isError(){ return m_error;}
     const std::string& getPattern() const { return m_pattern; }
@@ -310,6 +373,7 @@ public:
                     std::shared_ptr<LogEvent>event) override;
     
 };
+//同步文件日志
 class FileLogAppender : public LogAppender{
 public:
     explicit FileLogAppender(std::string filename,LogLevel::Level level = LogLevel::DEBUG):
@@ -352,7 +416,7 @@ public:
         return m_fileName; //在以后可以知道 日志写去了哪里
     }
 private:
-    bool reopenUnlocked(){
+    bool reopenUnlocked(){ // 只有work调用
         if(m_fileStream.is_open()){
             m_fileStream.close();
         }
@@ -366,11 +430,140 @@ private:
     std::ofstream m_fileStream;
     std::time_t m_lastReopen = 0;
 };
+//异步文件日志
+// 文件描述符 由worker独占
+class AsyncFileLogAppender:public LogAppender{
+public:
+    //异步系统一定要回答：消费者跟不上生产者时，到底怎么办？
+    // 无唯一正确答案 -> 策略显式化
+    enum class OverflowPolicy{
+        DropNewest,
+        BlockProducer
+    }; // 两种溢出策略
+
+    struct Options{
+        //解决大量短且多的日志
+        std::size_t max_queue_items = 8192;
+        //解决 大日志冲破内存
+        std::size_t max_queue_bytes = 8 * 1024 * 1024;   //8M
+         std::size_t batch_items = 256;// 队列达到多少条时主动唤醒 worker，尽快批量写。
+        // 普通低流量日志允许等待的聚合窗口，减少“一条日志一次 flush”。
+        std::chrono::milliseconds flush_interval{100};
+        
+        OverflowPolicy overflow_policy = OverflowPolicy::DropNewest;
+        // 达到此级别时触发 force_flush_，让 worker 尽快处理。
+        LogLevel::Level flush_on_level = LogLevel::ERROR;
+        // true 时 FATAL 入队后调用 flush()，等待本条及此前日志被 worker 处理。
+        bool sync_flush_fatal = true; // fatal 是否刷新 //todo ?  
+    };
+    //capacity ： 最多允许多少条已经格式化的日志暂存在内存队列里。
+    explicit AsyncFileLogAppender(std::string file_name , 
+                                std::size_t capacity = 8192, 
+                                LogLevel::Level level = LogLevel::DEBUG)
+        :LogAppender(level) , m_fileName(std::move(file_name)) , m_capacity(capacity),
+        m_fileStream(m_fileName , std::ios::out | std::ios::app),
+        m_worker( &AsyncFileLogAppender::workerLoop,this)
+        { 
+            // 文件已尝试打开+后台线程已启动
+            // 在这里启动 worker : 这是一种 RAII 思路：AsyncFileLogAppender 对象存在=后台消费能力已经存在
+            //  不用再手动调用 start 
+        }
+
+    ~AsyncFileLogAppender() override{  // 异步的核心
+        {
+            std::lock_guard<std::mutex> lock(m_queuemutex);
+            m_stop = true;
+        }
+        m_cv.notify_one();//告诉 worker：状态变了，起来检查
+        if(m_worker.joinable()){
+             m_worker.join();//当前析构线程等待 worker 线程真正结束。
+        }
+        //“正常退出不丢”不等于“任何情况下不丢” 
+        /* SIGKILL
+        进程 crash
+        abort
+        机器断电
+        内核 panic
+        文件系统故障*/
+        // 没有办法正常退出的 ， 无法保证不丢
+    }
+  
+    virtual void log(std::shared_ptr<Logger>logger , LogLevel::Level level , 
+                    std::shared_ptr<LogEvent>event) override;
+    
+    std::uint64_t getDropped() const {
+        return m_dropped.load();  //记录丢弃过 多少日志
+    }
+     void flush(); // 刷新
+private:
+    struct Record{
+        std::uint64_t sequence = 0;
+        std::string line;
+    };
+    void workerLoop();
+    bool fitsUnlocked(std::size_t bytes) const;
+
+private:
+    std::string m_fileName;
+    Options m_options;
+
+    std::deque<Record>m_queue;
+    std::size_t m_queue_bytes;//它不是 atomic。 与m_queue同时变化 
+    std::size_t m_capacity;
+
+
+    // ===== 生产者/消费者队列状态 =====
+    ////生产者消费者锁 : 保护queue_、queued_bytes_、stopping_、force_flush_。
+    std::mutex m_queuemutex;        // 父类的锁是保护 formatter m_hasFormatter的
+    // producer 用它唤醒 worker：有新任务/达到 batch/高优先级/stop/flush。
+    std::condition_variable m_cv;
+    // BlockProducer 在队列满时睡在这里；worker swap 掉队列后 notify_all。
+    std::condition_variable m_notFullcv; // BlockProducer等待队列不满 条件变量
+    // flush() 在这里等待 m_flushedSequence 的推进
+    std::condition_variable m_drainedCv;  //drain: （翻）消耗
+
+
+    bool m_stop = false;
+
+    // 要求 worker 不再等待聚合窗口，尽快处理当前日志。
+    bool m_forceFlush = false;
+
+    std::ofstream m_fileStream;
+    
+
+    // ===== 生命周期 =====
+    //// 唯一后台消费者线程。
+    std::thread m_worker;
+    // 让 stop() 具备幂等性：显式 stop 和析构 stop 多次调用只真正执行一次。
+    std::once_flag stop_once_; // todo
+    // producer 的快速入口开关。false 后 log() 不再接受新日志。
+    std::atomic<bool> m_accepting{true};
+
+
+    // ===== sequence / flush 进度 =====
+    // 下一条成功入队日志的全局单调 sequence。
+    std::atomic<std::uint64_t> m_nextSequence{0};
+    // 成功进入共享队列的总记录数；当前实现中与最后已分配 sequence 数值同步增长。
+    std::atomic<std::uint64_t> m_enqueued{0};
+    // worker 已“处理决定完成”的最大 sequence（成功或 I/O 失败都可推进）。
+    std::atomic<std::uint64_t> m_processedSequence{0};
+    // flush() 使用的完成进度。
+    // 当前语义更准确地说是“已处理到该序号并完成一次文件阶段决定”，不是 fsync 成功证明。
+    std::atomic<std::uint64_t> m_flushedSequence{0};
+
+    // ===== 统计指标 =====
+    std::atomic<std::uint64_t> m_dropped{0};//记录有多少被丢弃的日志 多个线程都会操作
+    std::atomic<std::uint64_t> m_oversized{0}; //记录有多少条过大的日志
+    //生命周期错误/晚到日志统计。
+    //便于区分：队列过载 和 Appender 已关闭
+    std::atomic<std::uint64_t>m_rejectAfterStop{0};
+};
+
 
 //描述： 我希望创建一个什么样的 Appender。
 struct AppenderConfig{
     enum class Type{
-        Stdout , File
+        Stdout , File , AsyncFile
     };
     Type type = Type::Stdout;
     LogLevel::Level level = LogLevel::DEBUG; // Appender 就有过滤的能力 ， 也有级别
@@ -456,22 +649,31 @@ public:
                 LogAppender::ptr appender;
                 if(appender_config.type == AppenderConfig::Type::Stdout){
                     appender = std::make_shared<StdOutLogAppender>();
-                }else{
-                    if(appender_config.file.empty()){ //文件目的地空
+                }else {
+                     if(appender_config.file.empty()){ //文件目的地空
                         continue;  // todo: config error
-
-
                     }
-                    appender = std::make_shared<FileLogAppender>(appender_config.file);
+
+                    if(appender_config.type == AppenderConfig::Type::File){
+                        appender = std::make_shared<FileLogAppender>(appender_config.file);
+                    }else{
+                        appender = std::make_shared<AsyncFileLogAppender>(appender_config.file);
+                    }
                 }
+                
+                
+              
                 appender->setlevel(appender_config.level);
                 if(!appender_config.formatter.empty()){
                     auto formatter = std::make_shared<LogFormatter>(appender_config.formatter);
-            
-                    if(!formatter->isError())           // todo : 后续记录错误 并反馈 ，要让用户知道           
+                    
+                    if(!formatter->isError()){  // todo : 后续记录错误 并反馈 ，要让用户知道           
                         appender->setFormatter(std::move(formatter) );
+                        
+                        //std::cout <<appender_config.formatter<<std::endl;
+                    }
                 }
-                logger->addAppender(appender);
+                logger->addAppender(std:: move(appender) );
             }
 
         }
@@ -513,8 +715,7 @@ private:
 #define MINI_LOG_LEVEL(logger , level) \
     if( (logger) -> getLevel() <= (level)  )\
         LogEventWarp( std::make_shared<LogEvent>(  \
-            (logger) , (level) , __FILE__ , __LINE__ , \
-                 std::time(nullptr) \
+            (logger) , (level) , __FILE__ , __LINE__  \
         ) ) .getSS()
 
 #define MINI_LOG_ROOT()     LogManager::GetInstance().getRoot()
@@ -529,8 +730,7 @@ private:
 #define MINI_LOG_FMT_LEVEL(logger , level , fmt , ...) \
     if( (logger) -> getLevel() <= (level)  )\
         LogEventWarp( std::make_shared<LogEvent>(  \
-            (logger) , (level) , __FILE__ , __LINE__ , \
-                 std::time(nullptr) \
+            (logger) , (level) , __FILE__ , __LINE__  \
         ) ).getEvent()->format((fmt), __VA_ARGS__)
 
 #define MINI_LOG_FMT_INFO(logger, fmt, ...) \
